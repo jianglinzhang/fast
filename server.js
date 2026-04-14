@@ -520,84 +520,78 @@ import { performance } from 'node:perf_hooks';
 const PORT = process.env.PORT || 10000;
 
 // ==================== 配置 ====================
+const ENABLE_PINNED = process.env.ENABLE_PINNED !== '0';
+const LOG_QUERIES = process.env.LOG_QUERIES !== '0';
+
+const UPSTREAM_TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT || 2500);
+const CACHE_MAX = Number(process.env.CACHE_MAX || 10000);
+const MIN_TTL = Number(process.env.MIN_TTL || 60);
+const MAX_TTL = Number(process.env.MAX_TTL || 86400);
+const NEGATIVE_TTL = Number(process.env.NEGATIVE_TTL || 60);
+const STALE_WINDOW = Number(process.env.STALE_WINDOW || 3600);
+
+// 浏览器安全 DNS 真正用的是 wire format。
+// 这里的 JSON 只是给首页测试面板和后台刷新用。
 const UPSTREAMS = [
-  { name: 'cloudflare', url: 'https://cloudflare-dns.com/dns-query' },
+  { name: 'cf', url: 'https://cloudflare-dns.com/dns-query' },
   { name: 'google', url: 'https://dns.google/dns-query' },
 ];
 
-const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 2500);
-
-const MIN_TTL = 60;
-const MAX_TTL = 86400;
-const NEGATIVE_TTL = 120;
-const STALE_WINDOW_SEC = 3600;
-const MAX_CACHE_SIZE = 5000;
-
-// 你当前只关心 linux.do，所以优先硬编码
-// 注意：Cloudflare 代理 IP 未来可能变化，如失效请更新
-const HARDCODED = {
+// 你目前只关心 linux.do：优先硬编码
+// 这些值会在后台定时从上游刷新，避免长久写死。
+const PINNED_STATE = {
   'linux.do': {
-    A: ['172.66.166.61', '104.20.16.234'],
+    A: ['104.20.16.234', '172.66.166.61'],
+    AAAA: ['2606:4700:20::6812:10ea', '2606:4700:20::ac42:a63d'],
   },
-  // 如果你确认 connect.linux.do 也要固定，可取消注释
-  // 'connect.linux.do': {
-  //   A: ['172.66.166.61', '104.20.16.234'],
-  // },
+  'connect.linux.do': {
+    A: ['104.20.16.234', '172.66.166.61'],
+    AAAA: ['2606:4700:20::6812:10ea', '2606:4700:20::ac42:a63d'],
+  },
 };
 
-const HARDCODED_TTL = 300;
+const PINNED_TTL = Number(process.env.PINNED_TTL || 120);
+const PINNED_REFRESH_MS = Number(process.env.PINNED_REFRESH_MS || 10 * 60 * 1000);
 
-// ==================== 内存缓存 ====================
+// ==================== CORS / Timing headers ====================
+const COMMON_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Accept',
+  'Access-Control-Max-Age': '86400',
+  'Timing-Allow-Origin': '*',
+};
+
+// ==================== 缓存 ====================
 const cache = new Map();
-const inflight = new Map();
 
 function clampTtl(ttl) {
-  return Math.max(MIN_TTL, Math.min(Number(ttl || MIN_TTL), MAX_TTL));
-}
-
-function normalizeName(name) {
-  return String(name || '').trim().replace(/\.+$/, '').toLowerCase();
-}
-
-function cacheSet(key, entry) {
-  if (cache.has(key)) cache.delete(key);
-  cache.set(key, {
-    ...entry,
-    ttl: clampTtl(entry.ttl),
-    time: Date.now(),
-  });
-
-  if (cache.size > MAX_CACHE_SIZE) {
-    const oldestKey = cache.keys().next().value;
-    cache.delete(oldestKey);
-  }
+  const t = Number(ttl || MIN_TTL);
+  return Math.max(MIN_TTL, Math.min(t, MAX_TTL));
 }
 
 function cacheGet(key) {
   const entry = cache.get(key);
   if (!entry) return null;
 
-  const ageSec = Math.floor((Date.now() - entry.time) / 1000);
+  const ageMs = Date.now() - entry.time;
+  const ttlMs = entry.ttl * 1000;
 
-  // LRU touch
-  cache.delete(key);
-  cache.set(key, entry);
-
-  if (ageSec < entry.ttl) {
+  if (ageMs < ttlMs) {
     return {
-      entry,
+      ...entry,
       status: 'HIT',
-      ageSec,
-      remainingTtl: Math.max(1, entry.ttl - ageSec),
+      ageSec: Math.floor(ageMs / 1000),
+      leftTtl: Math.max(0, entry.ttl - Math.floor(ageMs / 1000)),
     };
   }
 
-  if (ageSec < entry.ttl + STALE_WINDOW_SEC) {
+  if (ageMs < ttlMs + STALE_WINDOW * 1000) {
     return {
-      entry,
+      ...entry,
       status: 'STALE',
-      ageSec,
-      remainingTtl: 1,
+      ageSec: Math.floor(ageMs / 1000),
+      leftTtl: 0,
     };
   }
 
@@ -605,7 +599,69 @@ function cacheGet(key) {
   return null;
 }
 
-// ==================== Base64url ====================
+function cacheSet(key, value, ttl, meta = {}) {
+  if (cache.size >= CACHE_MAX) {
+    const oldestKey = cache.keys().next().value;
+    cache.delete(oldestKey);
+  }
+  cache.set(key, {
+    ...value,
+    ttl: clampTtl(ttl),
+    time: Date.now(),
+    meta,
+  });
+}
+
+function cacheClear() {
+  cache.clear();
+}
+
+// ==================== 工具 ====================
+function nowMs() {
+  return performance.now();
+}
+
+function round(n) {
+  return Math.round(n * 10) / 10;
+}
+
+function reqId() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function clientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) return String(xff).split(',')[0].trim();
+  return req.socket?.remoteAddress || '-';
+}
+
+function typeNumToName(n) {
+  switch (n) {
+    case 1: return 'A';
+    case 28: return 'AAAA';
+    case 5: return 'CNAME';
+    case 15: return 'MX';
+    case 16: return 'TXT';
+    case 2: return 'NS';
+    case 65: return 'HTTPS';
+    default: return String(n || '');
+  }
+}
+
+function typeNameToNum(t) {
+  const x = String(t || 'A').toUpperCase();
+  switch (x) {
+    case 'A': return 1;
+    case 'AAAA': return 28;
+    case 'CNAME': return 5;
+    case 'MX': return 15;
+    case 'TXT': return 16;
+    case 'NS': return 2;
+    case 'HTTPS': return 65;
+    default: return 1;
+  }
+}
+
 function b64encode(buf) {
   return Buffer.from(buf).toString('base64url');
 }
@@ -614,194 +670,209 @@ function b64decode(str) {
   return Buffer.from(str, 'base64url');
 }
 
-function stableWireKey(dns64) {
-  try {
-    const buf = Buffer.from(b64decode(dns64));
-    if (buf.length >= 2) {
-      buf[0] = 0;
-      buf[1] = 0;
+function stableWireKeyFromBuffer(buf) {
+  const copy = Buffer.from(buf);
+  if (copy.length >= 2) {
+    copy[0] = 0;
+    copy[1] = 0;
+  }
+  return b64encode(copy);
+}
+
+function jsonLog(obj) {
+  if (!LOG_QUERIES) return;
+  console.log(JSON.stringify(obj));
+}
+
+function sendJson(res, code, obj, headers = {}) {
+  res.writeHead(code, {
+    ...headers,
+    'Content-Type': 'application/json; charset=utf-8',
+  });
+  res.end(JSON.stringify(obj));
+}
+
+function addCommonHeaders(res) {
+  for (const [k, v] of Object.entries(COMMON_HEADERS)) {
+    res.setHeader(k, v);
+  }
+}
+
+function buildServerTiming(timings) {
+  const parts = [];
+  for (const [k, v] of Object.entries(timings)) {
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      parts.push(`${k};dur=${round(v)}`);
     }
-    return b64encode(buf);
-  } catch {
-    return dns64;
+  }
+  return parts.join(', ');
+}
+
+function finalizeDoHHeaders(res, ctx, extra = {}) {
+  const total = nowMs() - ctx.start;
+  ctx.timings.total = total;
+
+  res.setHeader('X-Trace-Id', ctx.id);
+  res.setHeader('X-App-Time-Ms', String(round(total)));
+  res.setHeader('Server-Timing', buildServerTiming(ctx.timings));
+  res.setHeader('Cache-Control', 'no-store');
+  for (const [k, v] of Object.entries(extra)) {
+    res.setHeader(k, v);
   }
 }
 
-// ==================== DNS 辅助 ====================
-function typeNumToName(type) {
-  if (type === 1) return 'A';
-  if (type === 28) return 'AAAA';
-  if (type === 5) return 'CNAME';
-  if (type === 15) return 'MX';
-  if (type === 16) return 'TXT';
-  if (type === 2) return 'NS';
-  return String(type);
+function logDone(ctx, extra = {}) {
+  const total = nowMs() - ctx.start;
+  const log = {
+    at: new Date().toISOString(),
+    id: ctx.id,
+    ip: ctx.ip,
+    method: ctx.method,
+    path: ctx.path,
+    kind: ctx.kind,
+    qname: ctx.qname || '',
+    qtype: ctx.qtype || '',
+    source: ctx.source || '',
+    cache: ctx.cacheStatus || '',
+    upstreamWinner: ctx.upstreamWinner || '',
+    upstreams: ctx.upstreams || [],
+    timings: Object.fromEntries(
+      Object.entries({ ...ctx.timings, total }).map(([k, v]) => [k, round(v)])
+    ),
+    ua: ctx.ua || '',
+    ...extra,
+  };
+  jsonLog(log);
 }
 
-function typeNameToNum(type) {
-  const t = String(type || '').toUpperCase();
-  if (t === 'A') return 1;
-  if (t === 'AAAA') return 28;
-  if (t === 'CNAME') return 5;
-  if (t === 'MX') return 15;
-  if (t === 'TXT') return 16;
-  if (t === 'NS') return 2;
-  return 1;
-}
-
-function getHardcodedAnswers(name, type) {
-  const n = normalizeName(name);
-  const t = String(type || '').toUpperCase();
-  return HARDCODED[n]?.[t] || null;
-}
-
-function skipNameView(v, o) {
-  while (o < v.byteLength) {
-    const len = v.getUint8(o);
-    if (len === 0) return o + 1;
-    if ((len & 0xc0) === 0xc0) return o + 2;
-    o += 1 + len;
-  }
-  return o;
-}
-
-function skipNameBuf(buf, o) {
-  while (o < buf.length) {
-    const len = buf[o];
-    if (len === 0) return o + 1;
-    if ((len & 0xc0) === 0xc0) return o + 2;
-    o += 1 + len;
-  }
-  return o;
-}
-
+// ==================== DNS wire 解析 / 构造 ====================
 function parseWireQuery(buf) {
   try {
-    if (!Buffer.isBuffer(buf)) buf = Buffer.from(buf);
-    if (buf.length < 17) return null;
+    if (!buf || buf.length < 17) return null;
 
-    const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-    const qd = v.getUint16(4);
-    if (qd < 1) return null;
-
-    let o = 12;
+    let offset = 12;
     const labels = [];
 
-    while (o < buf.length) {
-      const len = buf[o];
+    while (offset < buf.length) {
+      const len = buf[offset];
       if (len === 0) {
-        o++;
+        offset += 1;
         break;
       }
-      if ((len & 0xc0) === 0xc0) return null;
-      o++;
-      if (o + len > buf.length) return null;
-      labels.push(buf.subarray(o, o + len).toString('ascii'));
-      o += len;
+      if ((len & 0xc0) === 0xc0) {
+        return null; // query 一般不会压缩，遇到压缩名直接放弃硬编码分支
+      }
+      if (offset + 1 + len > buf.length) return null;
+      labels.push(buf.slice(offset + 1, offset + 1 + len).toString('ascii'));
+      offset += 1 + len;
     }
 
-    if (o + 4 > buf.length) return null;
+    if (offset + 4 > buf.length) return null;
 
-    const qtype = v.getUint16(o);
-    const qclass = v.getUint16(o + 2);
-    if (qclass !== 1) return null;
+    const qtype = buf.readUInt16BE(offset);
+    const qclass = buf.readUInt16BE(offset + 2);
+    const rd = (buf[2] & 0x01) === 0x01;
 
     return {
-      name: normalizeName(labels.join('.')),
+      name: labels.join('.').toLowerCase(),
       qtype,
-      questionEnd: o + 4,
+      qclass,
+      rd,
+      questionEnd: offset + 4,
     };
   } catch {
     return null;
   }
 }
 
-function ipv4ToBuf(ip) {
-  const parts = String(ip).split('.').map(x => Number(x));
-  if (parts.length !== 4 || parts.some(x => !Number.isInteger(x) || x < 0 || x > 255)) return null;
-  return Buffer.from(parts);
-}
-
-function ipv6ToBuf(ip) {
+function ipv6ToBuffer(ip) {
   try {
-    const s = String(ip).toLowerCase();
+    let left = [];
+    let right = [];
 
-    if (!s.includes(':')) return null;
+    if (ip.includes('::')) {
+      const parts = ip.split('::');
+      left = parts[0] ? parts[0].split(':') : [];
+      right = parts[1] ? parts[1].split(':') : [];
+    } else {
+      left = ip.split(':');
+    }
 
-    let [left, right] = s.split('::');
-    const leftParts = left ? left.split(':').filter(Boolean) : [];
-    const rightParts = right ? right.split(':').filter(Boolean) : [];
-
-    const missing = 8 - (leftParts.length + rightParts.length);
+    const missing = 8 - (left.length + right.length);
     if (missing < 0) return null;
 
-    const full = [...leftParts, ...Array(missing).fill('0'), ...rightParts];
+    const full = [...left, ...Array(missing).fill('0'), ...right];
     if (full.length !== 8) return null;
 
-    const buf = Buffer.alloc(16);
+    const out = Buffer.alloc(16);
     for (let i = 0; i < 8; i++) {
-      const n = parseInt(full[i], 16);
-      if (!Number.isInteger(n) || n < 0 || n > 0xffff) return null;
-      buf.writeUInt16BE(n, i * 2);
+      const n = parseInt(full[i] || '0', 16);
+      if (!Number.isFinite(n) || n < 0 || n > 0xffff) return null;
+      out.writeUInt16BE(n, i * 2);
     }
-    return buf;
+    return out;
   } catch {
     return null;
   }
 }
 
-function buildWireResponseFromQuery(queryBuf, qtype, answers, ttl = HARDCODED_TTL) {
-  const parsed = parseWireQuery(queryBuf);
-  if (!parsed) return null;
+function buildPinnedWireResponse(queryBuf, parsed, answers, ttlSec = PINNED_TTL) {
+  const tx0 = queryBuf[0];
+  const tx1 = queryBuf[1];
+  const rdBit = parsed.rd ? 0x01 : 0x00;
 
-  const question = queryBuf.subarray(12, parsed.questionEnd);
+  const header = Buffer.from([
+    tx0, tx1,         // ID
+    0x80 | rdBit,     // QR=1, RD=copy
+    0x80,             // RA=1
+    0x00, 0x01,       // QDCOUNT
+    0x00, answers.length, // ANCOUNT
+    0x00, 0x00,       // NSCOUNT
+    0x00, 0x00,       // ARCOUNT
+  ]);
 
-  const header = Buffer.alloc(12);
-  header[0] = queryBuf[0];
-  header[1] = queryBuf[1];
-  header[2] = 0x81; // QR=1, RD=1
-  header[3] = 0x80; // RA=1
-  header.writeUInt16BE(1, 4); // QDCOUNT
-  header.writeUInt16BE(answers.length, 6); // ANCOUNT
-  header.writeUInt16BE(0, 8); // NSCOUNT
-  header.writeUInt16BE(0, 10); // ARCOUNT
+  const question = queryBuf.slice(12, parsed.questionEnd);
+
+  const ttl = Buffer.alloc(4);
+  ttl.writeUInt32BE(ttlSec);
 
   const rrList = [];
 
-  for (const ans of answers) {
-    if (qtype === 1) {
-      const rdata = ipv4ToBuf(ans);
-      if (!rdata) continue;
-
-      const rr = Buffer.alloc(16);
-      rr[0] = 0xc0; rr[1] = 0x0c; // 指向 question name
-      rr.writeUInt16BE(1, 2);     // TYPE A
-      rr.writeUInt16BE(1, 4);     // CLASS IN
-      rr.writeUInt32BE(ttl >>> 0, 6);
-      rr.writeUInt16BE(4, 10);
-      rdata.copy(rr, 12);
-      rrList.push(rr);
-    } else if (qtype === 28) {
-      const rdata = ipv6ToBuf(ans);
-      if (!rdata) continue;
-
-      const rr = Buffer.alloc(28);
-      rr[0] = 0xc0; rr[1] = 0x0c;
-      rr.writeUInt16BE(28, 2);    // AAAA
-      rr.writeUInt16BE(1, 4);
-      rr.writeUInt32BE(ttl >>> 0, 6);
-      rr.writeUInt16BE(16, 10);
-      rdata.copy(rr, 12);
-      rrList.push(rr);
+  for (const answer of answers) {
+    if (parsed.qtype === 1) {
+      const parts = answer.split('.').map(x => Number(x));
+      if (parts.length !== 4 || parts.some(x => !Number.isInteger(x) || x < 0 || x > 255)) {
+        continue;
+      }
+      rrList.push(Buffer.from([
+        0xc0, 0x0c,       // NAME pointer
+        0x00, 0x01,       // TYPE A
+        0x00, 0x01,       // CLASS IN
+        ttl[0], ttl[1], ttl[2], ttl[3],
+        0x00, 0x04,
+        parts[0], parts[1], parts[2], parts[3],
+      ]));
+    } else if (parsed.qtype === 28) {
+      const buf = ipv6ToBuffer(answer);
+      if (!buf) continue;
+      rrList.push(Buffer.concat([
+        Buffer.from([
+          0xc0, 0x0c,     // NAME pointer
+          0x00, 0x1c,     // TYPE AAAA
+          0x00, 0x01,     // CLASS IN
+          ttl[0], ttl[1], ttl[2], ttl[3],
+          0x00, 0x10,
+        ]),
+        buf,
+      ]));
     }
   }
 
-  header.writeUInt16BE(rrList.length, 6);
   return Buffer.concat([header, question, ...rrList]);
 }
 
-function buildJsonResponse(name, type, answers, ttl = HARDCODED_TTL) {
-  const t = typeNameToNum(type);
+function buildPinnedJsonResponse(name, type, answers, ttlSec = PINNED_TTL) {
+  const qtype = typeNameToNum(type);
   return JSON.stringify({
     Status: 0,
     TC: false,
@@ -809,245 +880,199 @@ function buildJsonResponse(name, type, answers, ttl = HARDCODED_TTL) {
     RA: true,
     AD: false,
     CD: false,
-    Question: [{ name: `${normalizeName(name)}.`, type: t }],
-    Answer: answers.map(v => ({
-      name: `${normalizeName(name)}.`,
-      type: t,
-      TTL: ttl,
-      data: v,
+    Question: [
+      { name: `${name}.`, type: qtype },
+    ],
+    Answer: answers.map(data => ({
+      name: `${name}.`,
+      type: qtype,
+      TTL: ttlSec,
+      data,
     })),
   });
 }
 
-function extractMinTtlWire(buf) {
-  try {
-    const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-    const qd = v.getUint16(4);
-    const an = v.getUint16(6);
-    const ns = v.getUint16(8);
+// ==================== TTL 解析 ====================
+function skipName(view, offset) {
+  while (offset < view.byteLength) {
+    const len = view.getUint8(offset);
+    if (len === 0) return offset + 1;
+    if ((len & 0xc0) === 0xc0) return offset + 2;
+    offset += 1 + len;
+  }
+  return offset;
+}
 
-    let o = 12;
+function extractTtlFromWire(buf) {
+  try {
+    const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const qd = view.getUint16(4);
+    const an = view.getUint16(6);
+
+    let offset = 12;
     for (let i = 0; i < qd; i++) {
-      o = skipNameView(v, o);
-      o += 4;
+      offset = skipName(view, offset);
+      offset += 4;
     }
 
-    if (an === 0 && ns === 0) return NEGATIVE_TTL;
+    if (an === 0) return NEGATIVE_TTL;
 
     let min = 0xffffffff;
-
-    for (let i = 0; i < an + ns; i++) {
-      o = skipNameView(v, o);
-      const type = v.getUint16(o);
-      const ttl = v.getUint32(o + 4);
-      if (type !== 41 && ttl < min) min = ttl; // 排除 OPT
-      o += 10 + v.getUint16(o + 8);
+    for (let i = 0; i < an; i++) {
+      offset = skipName(view, offset);
+      const ttl = view.getUint32(offset + 4);
+      if (ttl < min) min = ttl;
+      offset += 10 + view.getUint16(offset + 8);
     }
 
-    return min === 0xffffffff ? NEGATIVE_TTL : min;
+    return min === 0xffffffff ? MIN_TTL : min;
   } catch {
     return MIN_TTL;
   }
 }
 
-function patchWireTtl(buf, ttl) {
-  const out = Buffer.from(buf);
-  try {
-    const v = new DataView(out.buffer, out.byteOffset, out.byteLength);
-    const qd = v.getUint16(4);
-    const an = v.getUint16(6);
-    const ns = v.getUint16(8);
-
-    let o = 12;
-    for (let i = 0; i < qd; i++) {
-      o = skipNameView(v, o);
-      o += 4;
-    }
-
-    for (let i = 0; i < an + ns; i++) {
-      o = skipNameView(v, o);
-      const type = v.getUint16(o);
-      if (type !== 41) {
-        v.setUint32(o + 4, Math.max(1, ttl) >>> 0);
-      }
-      o += 10 + v.getUint16(o + 8);
-    }
-  } catch {}
-  return out;
-}
-
-function adjustJsonTtlString(text, ttl) {
+function extractTtlFromJsonText(text) {
   try {
     const j = JSON.parse(text);
-    if (Array.isArray(j.Answer)) {
-      for (const a of j.Answer) a.TTL = Math.max(1, ttl);
+    if (Array.isArray(j.Answer) && j.Answer.length > 0) {
+      return Math.min(...j.Answer.map(a => Number(a.TTL || MIN_TTL)));
     }
-    if (Array.isArray(j.Authority)) {
-      for (const a of j.Authority) {
-        if (typeof a.TTL === 'number') a.TTL = Math.max(1, ttl);
-      }
-    }
-    return JSON.stringify(j);
+    return NEGATIVE_TTL;
   } catch {
-    return text;
+    return MIN_TTL;
   }
 }
 
 // ==================== 上游请求 ====================
-async function fetchUpstreamRace(buildUrl, headers) {
-  const tasks = UPSTREAMS.map(async (u) => {
-    const t0 = performance.now();
-    const resp = await fetch(buildUrl(u), {
-      method: 'GET',
-      headers: {
-        ...headers,
-        'Cache-Control': 'no-cache',
-        Pragma: 'no-cache',
-      },
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+async function fetchOneUpstream(upstream, path, headers, trace) {
+  const t0 = nowMs();
+  try {
+    const resp = await fetch(`${upstream.url}${path}`, {
+      headers,
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT),
     });
-    if (!resp.ok) throw new Error(`${u.name}:${resp.status}`);
-    return {
-      upstream: u.name,
-      ms: performance.now() - t0,
-      resp,
-    };
-  });
+    const ms = nowMs() - t0;
+
+    trace.push({
+      name: upstream.name,
+      ok: resp.ok,
+      status: resp.status,
+      ms: round(ms),
+    });
+
+    if (!resp.ok) {
+      throw new Error(`${upstream.name}:${resp.status}`);
+    }
+
+    return { upstream: upstream.name, resp, ms };
+  } catch (e) {
+    const ms = nowMs() - t0;
+    trace.push({
+      name: upstream.name,
+      ok: false,
+      error: e?.name || e?.message || 'fetch_error',
+      ms: round(ms),
+    });
+    throw e;
+  }
+}
+
+async function fetchUpstreamRace(path, headers, ctx) {
+  const t0 = nowMs();
+  const trace = [];
+
+  const promises = UPSTREAMS.map(u => fetchOneUpstream(u, path, headers, trace));
 
   try {
-    return await Promise.any(tasks);
+    const result = await Promise.any(promises);
+    ctx.timings.upstream = nowMs() - t0;
+    ctx.upstreams = trace;
+    ctx.upstreamWinner = result.upstream;
+    return result;
   } catch {
+    ctx.timings.upstream = nowMs() - t0;
+    ctx.upstreams = trace;
     throw new Error('All upstreams failed');
   }
 }
 
-async function loadWireFromUpstream(dns64) {
-  const result = await fetchUpstreamRace(
-    (u) => `${u.url}?dns=${encodeURIComponent(dns64)}`,
-    { Accept: 'application/dns-message' }
-  );
-
-  const data = Buffer.from(await result.resp.arrayBuffer());
-  return {
-    data,
-    ttl: clampTtl(extractMinTtlWire(data)),
-    upstream: result.upstream,
-    upstreamMs: result.ms,
-  };
-}
-
-async function loadJsonFromUpstream(name, type) {
-  const result = await fetchUpstreamRace(
-    (u) => `${u.url}?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`,
-    { Accept: 'application/dns-json' }
-  );
-
-  const text = await result.resp.text();
-
-  let ttl = MIN_TTL;
-  try {
-    const j = JSON.parse(text);
-    if (Array.isArray(j.Answer) && j.Answer.length > 0) {
-      ttl = Math.min(...j.Answer.map(a => Number(a.TTL || MIN_TTL)));
-    } else {
-      ttl = NEGATIVE_TTL;
+async function fetchUpstreamSimple(path, headers) {
+  for (const u of UPSTREAMS) {
+    try {
+      const r = await fetch(`${u.url}${path}`, {
+        headers,
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT),
+      });
+      if (r.ok) return { upstream: u.name, resp: r };
+    } catch {
+      // continue
     }
-  } catch {
-    ttl = MIN_TTL;
+  }
+  throw new Error('All upstreams failed');
+}
+
+// ==================== Pinned 逻辑 ====================
+function getPinnedAnswers(name, type) {
+  if (!ENABLE_PINNED) return null;
+  const item = PINNED_STATE[String(name || '').toLowerCase()];
+  if (!item) return null;
+  const answers = item[String(type || '').toUpperCase()];
+  if (!Array.isArray(answers) || answers.length === 0) return null;
+  return answers;
+}
+
+async function refreshPinnedHost(name) {
+  const lower = name.toLowerCase();
+  const out = { ...PINNED_STATE[lower] };
+
+  for (const type of ['A', 'AAAA']) {
+    try {
+      const path = `?name=${encodeURIComponent(lower)}&type=${type}`;
+      const { upstream, resp } = await fetchUpstreamSimple(path, {
+        Accept: 'application/dns-json, application/json;q=0.9',
+      });
+      const text = await resp.text();
+      const data = JSON.parse(text);
+      const answers = Array.isArray(data.Answer)
+        ? data.Answer
+            .filter(a => a.type === typeNameToNum(type))
+            .map(a => a.data)
+            .filter(Boolean)
+        : [];
+
+      if (answers.length > 0) {
+        out[type] = answers;
+        jsonLog({
+          at: new Date().toISOString(),
+          kind: 'pinned-refresh',
+          name: lower,
+          type,
+          upstream,
+          answers,
+        });
+      }
+    } catch (e) {
+      jsonLog({
+        at: new Date().toISOString(),
+        kind: 'pinned-refresh-error',
+        name: lower,
+        type,
+        error: e.message,
+      });
+    }
   }
 
-  return {
-    data: text,
-    ttl: clampTtl(ttl),
-    upstream: result.upstream,
-    upstreamMs: result.ms,
-  };
+  PINNED_STATE[lower] = out;
 }
 
-// ==================== 后台刷新 ====================
-function refreshWire(dns64, key) {
-  if (inflight.has(key)) return;
-  const p = loadWireFromUpstream(dns64)
-    .then(r => cacheSet(key, { kind: 'wire', data: r.data, ttl: r.ttl }))
-    .catch(() => {})
-    .finally(() => inflight.delete(key));
-  inflight.set(key, p);
-}
-
-function refreshJson(name, type, key) {
-  if (inflight.has(key)) return;
-  const p = loadJsonFromUpstream(name, type)
-    .then(r => cacheSet(key, { kind: 'json', data: r.data, ttl: r.ttl }))
-    .catch(() => {})
-    .finally(() => inflight.delete(key));
-  inflight.set(key, p);
-}
-
-// ==================== 调试参数 ====================
-function getFlags(req, url) {
-  const forceUpstream =
-    url.searchParams.get('force_upstream') === '1' ||
-    req.headers['x-force-upstream'] === '1';
-
-  const noCache =
-    url.searchParams.get('no_cache') === '1' ||
-    req.headers['x-no-cache'] === '1';
-
-  return { forceUpstream, noCache };
-}
-
-// ==================== 响应头 ====================
-const EXPOSE_HEADERS = [
-  'X-DoH-Mode',
-  'X-DoH-Upstream',
-  'X-Upstream-Time-Ms',
-  'X-Server-Time-Ms',
-  'X-Cache',
-  'Server-Timing',
-];
-
-function setCors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, X-Force-Upstream, X-No-Cache');
-  res.setHeader('Access-Control-Expose-Headers', EXPOSE_HEADERS.join(', '));
-  res.setHeader('Access-Control-Max-Age', '86400');
-}
-
-function send(res, status, contentType, body, meta = {}) {
-  const totalMs = meta.start != null ? (performance.now() - meta.start) : 0;
-
-  res.statusCode = status;
-  res.setHeader('Content-Type', contentType);
-  res.setHeader('Cache-Control', 'no-store');
-
-  if (meta.mode) {
-    res.setHeader('X-DoH-Mode', meta.mode);
-    res.setHeader('X-Cache', meta.mode);
-  }
-  if (meta.upstream) res.setHeader('X-DoH-Upstream', meta.upstream);
-  if (meta.upstreamMs != null) res.setHeader('X-Upstream-Time-Ms', meta.upstreamMs.toFixed(1));
-  res.setHeader('X-Server-Time-Ms', totalMs.toFixed(1));
-
-  const timing = [`total;dur=${totalMs.toFixed(1)}`];
-  if (meta.upstreamMs != null) timing.push(`upstream;dur=${meta.upstreamMs.toFixed(1)}`);
-  res.setHeader('Server-Timing', timing.join(', '));
-
-  if (Buffer.isBuffer(body)) {
-    res.setHeader('Content-Length', body.length);
-    res.end(body);
-  } else {
-    const out = String(body);
-    res.setHeader('Content-Length', Buffer.byteLength(out));
-    res.end(out);
+async function refreshAllPinned() {
+  const names = Object.keys(PINNED_STATE);
+  for (const name of names) {
+    await refreshPinnedHost(name);
   }
 }
 
-function sendJsonError(res, status, message, meta = {}) {
-  send(res, status, 'application/json; charset=utf-8', JSON.stringify({ error: message }), meta);
-}
-
-// ==================== 读取 body ====================
+// ==================== body 读取 ====================
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -1057,307 +1082,329 @@ function readBody(req) {
   });
 }
 
-// ==================== JSON 查询 ====================
-async function handleJson(req, res, url) {
-  const start = performance.now();
-  const { forceUpstream, noCache } = getFlags(req, url);
+// ==================== wire 处理 ====================
+async function resolveWire(queryBuf, ctx) {
+  const parseStart = nowMs();
+  const parsed = parseWireQuery(queryBuf);
+  ctx.timings.parse = nowMs() - parseStart;
 
-  const name = normalizeName(url.searchParams.get('name'));
-  const type = String(url.searchParams.get('type') || 'A').toUpperCase();
+  if (parsed) {
+    ctx.qname = parsed.name;
+    ctx.qtype = typeNumToName(parsed.qtype);
+
+    const pinnedStart = nowMs();
+    const pinnedAnswers = getPinnedAnswers(parsed.name, ctx.qtype);
+    if (pinnedAnswers && (parsed.qtype === 1 || parsed.qtype === 28)) {
+      const data = buildPinnedWireResponse(queryBuf, parsed, pinnedAnswers, PINNED_TTL);
+      ctx.timings.build = nowMs() - pinnedStart;
+      ctx.source = 'PINNED';
+      ctx.cacheStatus = 'PINNED';
+      return {
+        data,
+        contentType: 'application/dns-message',
+        xCache: 'PINNED',
+      };
+    }
+    ctx.timings.pinned = nowMs() - pinnedStart;
+  }
+
+  const keyStart = nowMs();
+  const cacheKey = `w:${stableWireKeyFromBuffer(queryBuf)}`;
+  const hit = cacheGet(cacheKey);
+  ctx.timings.cache = nowMs() - keyStart;
+
+  if (hit) {
+    ctx.source = 'CACHE';
+    ctx.cacheStatus = hit.status;
+
+    if (hit.status === 'STALE') {
+      refreshWireInBackground(queryBuf, cacheKey);
+    }
+
+    return {
+      data: Buffer.from(hit.data),
+      contentType: 'application/dns-message',
+      xCache: hit.status,
+    };
+  }
+
+  const dns64 = b64encode(queryBuf);
+  const { resp, upstream } = await fetchUpstreamRace(
+    `?dns=${dns64}`,
+    { Accept: 'application/dns-message' },
+    ctx
+  );
+  const data = Buffer.from(await resp.arrayBuffer());
+  const ttl = extractTtlFromWire(data);
+  cacheSet(cacheKey, { data, contentType: 'application/dns-message' }, ttl, { upstream });
+
+  ctx.source = 'UPSTREAM';
+  ctx.cacheStatus = 'MISS';
+
+  return {
+    data,
+    contentType: 'application/dns-message',
+    xCache: 'MISS',
+  };
+}
+
+function refreshWireInBackground(queryBuf, cacheKey) {
+  const dns64 = b64encode(queryBuf);
+  fetchUpstreamSimple(`?dns=${dns64}`, { Accept: 'application/dns-message' })
+    .then(async ({ upstream, resp }) => {
+      const data = Buffer.from(await resp.arrayBuffer());
+      const ttl = extractTtlFromWire(data);
+      cacheSet(cacheKey, { data, contentType: 'application/dns-message' }, ttl, { upstream });
+    })
+    .catch(() => {});
+}
+
+// ==================== JSON 处理（给网页测试/后台刷新用） ====================
+async function handleJsonQuery(params, res, ctx) {
+  const name = String(params.get('name') || '').trim().toLowerCase();
+  const type = String(params.get('type') || 'A').trim().toUpperCase();
 
   if (!name) {
-    return sendJsonError(res, 400, 'Missing name', { start });
+    return sendJson(res, 400, { error: 'missing name' });
   }
 
-  // 1) 硬编码优先
-  if (!forceUpstream) {
-    const hardcoded = getHardcodedAnswers(name, type);
-    if (hardcoded) {
-      const body = buildJsonResponse(name, type, hardcoded, HARDCODED_TTL);
-      return send(res, 200, 'application/dns-json', body, {
-        start,
-        mode: 'HARDCODED',
-      });
-    }
-  }
+  ctx.kind = 'json';
+  ctx.qname = name;
+  ctx.qtype = type;
 
-  const key = `j:${name}:${type}`;
+  const pinnedStart = nowMs();
+  const pinnedAnswers = getPinnedAnswers(name, type);
+  if (pinnedAnswers && (type === 'A' || type === 'AAAA')) {
+    const text = buildPinnedJsonResponse(name, type, pinnedAnswers, PINNED_TTL);
+    ctx.timings.build = nowMs() - pinnedStart;
+    ctx.source = 'PINNED';
+    ctx.cacheStatus = 'PINNED';
 
-  // 2) 缓存
-  if (!noCache) {
-    const hit = cacheGet(key);
-    if (hit) {
-      const body = adjustJsonTtlString(hit.entry.data, hit.remainingTtl);
-      if (hit.status === 'STALE') refreshJson(name, type, key);
-      return send(res, 200, 'application/dns-json', body, {
-        start,
-        mode: hit.status,
-      });
-    }
-  }
-
-  // 3) 上游 / inflight 去重
-  let loader = inflight.get(key);
-  if (!loader || noCache) {
-    loader = loadJsonFromUpstream(name, type);
-    if (!noCache) {
-      inflight.set(key, loader.finally(() => inflight.delete(key)));
-    }
-  }
-
-  const result = await loader;
-  if (!noCache) {
-    cacheSet(key, {
-      kind: 'json',
-      data: result.data,
-      ttl: result.ttl,
+    finalizeDoHHeaders(res, ctx, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'X-Cache': 'PINNED',
     });
+    res.writeHead(200);
+    res.end(text);
+    return logDone(ctx, { status: 200 });
   }
+  ctx.timings.pinned = nowMs() - pinnedStart;
 
-  return send(res, 200, 'application/dns-json', result.data, {
-    start,
-    mode: noCache ? 'BYPASS' : 'MISS',
-    upstream: result.upstream,
-    upstreamMs: result.upstreamMs,
-  });
-}
+  const cacheStart = nowMs();
+  const cacheKey = `j:${name}:${type}`;
+  const hit = cacheGet(cacheKey);
+  ctx.timings.cache = nowMs() - cacheStart;
 
-// ==================== Wire GET ====================
-async function handleWireGet(req, res, url) {
-  const start = performance.now();
-  const { forceUpstream, noCache } = getFlags(req, url);
+  if (hit) {
+    ctx.source = 'CACHE';
+    ctx.cacheStatus = hit.status;
 
-  const dns64 = url.searchParams.get('dns');
-  if (!dns64) {
-    return sendJsonError(res, 400, 'Missing dns parameter', { start });
-  }
-
-  let raw;
-  try {
-    raw = b64decode(dns64);
-  } catch {
-    return sendJsonError(res, 400, 'Invalid dns parameter', { start });
-  }
-
-  // 1) 硬编码优先
-  if (!forceUpstream) {
-    const parsed = parseWireQuery(raw);
-    if (parsed) {
-      const hardcoded = getHardcodedAnswers(parsed.name, typeNumToName(parsed.qtype));
-      if (hardcoded) {
-        const body = buildWireResponseFromQuery(raw, parsed.qtype, hardcoded, HARDCODED_TTL);
-        if (body) {
-          return send(res, 200, 'application/dns-message', body, {
-            start,
-            mode: 'HARDCODED',
-          });
-        }
-      }
+    if (hit.status === 'STALE') {
+      refreshJsonInBackground(name, type, cacheKey);
     }
-  }
 
-  const key = `w:${stableWireKey(dns64)}`;
-
-  // 2) 缓存
-  if (!noCache) {
-    const hit = cacheGet(key);
-    if (hit) {
-      const body = patchWireTtl(hit.entry.data, hit.remainingTtl);
-      if (hit.status === 'STALE') refreshWire(dns64, key);
-      return send(res, 200, 'application/dns-message', body, {
-        start,
-        mode: hit.status,
-      });
-    }
-  }
-
-  // 3) 上游 / inflight 去重
-  let loader = inflight.get(key);
-  if (!loader || noCache) {
-    loader = loadWireFromUpstream(dns64);
-    if (!noCache) {
-      inflight.set(key, loader.finally(() => inflight.delete(key)));
-    }
-  }
-
-  const result = await loader;
-  if (!noCache) {
-    cacheSet(key, {
-      kind: 'wire',
-      data: result.data,
-      ttl: result.ttl,
+    finalizeDoHHeaders(res, ctx, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'X-Cache': hit.status,
     });
+    res.writeHead(200);
+    res.end(hit.data);
+    return logDone(ctx, { status: 200 });
   }
 
-  return send(res, 200, 'application/dns-message', result.data, {
-    start,
-    mode: noCache ? 'BYPASS' : 'MISS',
-    upstream: result.upstream,
-    upstreamMs: result.upstreamMs,
-  });
-}
-
-// ==================== Wire POST ====================
-async function handleWirePost(req, res, url) {
-  const start = performance.now();
-  const { forceUpstream, noCache } = getFlags(req, url);
-
-  const body = await readBody(req);
-  if (!body || body.length === 0) {
-    return sendJsonError(res, 400, 'Empty body', { start });
-  }
-
-  // 1) 硬编码优先
-  if (!forceUpstream) {
-    const parsed = parseWireQuery(body);
-    if (parsed) {
-      const hardcoded = getHardcodedAnswers(parsed.name, typeNumToName(parsed.qtype));
-      if (hardcoded) {
-        const out = buildWireResponseFromQuery(body, parsed.qtype, hardcoded, HARDCODED_TTL);
-        if (out) {
-          return send(res, 200, 'application/dns-message', out, {
-            start,
-            mode: 'HARDCODED',
-          });
-        }
-      }
-    }
-  }
-
-  const dns64 = b64encode(body);
-  const key = `w:${stableWireKey(dns64)}`;
-
-  // 2) 缓存
-  if (!noCache) {
-    const hit = cacheGet(key);
-    if (hit) {
-      const out = patchWireTtl(hit.entry.data, hit.remainingTtl);
-      if (hit.status === 'STALE') refreshWire(dns64, key);
-      return send(res, 200, 'application/dns-message', out, {
-        start,
-        mode: hit.status,
-      });
-    }
-  }
-
-  // 3) 上游 / inflight 去重
-  let loader = inflight.get(key);
-  if (!loader || noCache) {
-    loader = loadWireFromUpstream(dns64);
-    if (!noCache) {
-      inflight.set(key, loader.finally(() => inflight.delete(key)));
-    }
-  }
-
-  const result = await loader;
-  if (!noCache) {
-    cacheSet(key, {
-      kind: 'wire',
-      data: result.data,
-      ttl: result.ttl,
-    });
-  }
-
-  return send(res, 200, 'application/dns-message', result.data, {
-    start,
-    mode: noCache ? 'BYPASS' : 'MISS',
-    upstream: result.upstream,
-    upstreamMs: result.upstreamMs,
-  });
-}
-
-// ==================== 健康检查 ====================
-function handleHealth(res) {
-  send(
-    res,
-    200,
-    'application/json; charset=utf-8',
-    JSON.stringify({
-      status: 'ok',
-      cache: cache.size,
-      inflight: inflight.size,
-      uptime: Math.round(process.uptime()),
-      hardcoded: Object.keys(HARDCODED),
-    })
+  const { resp, upstream } = await fetchUpstreamRace(
+    `?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`,
+    { Accept: 'application/dns-json, application/json;q=0.9' },
+    ctx
   );
+
+  const text = await resp.text();
+  const ttl = extractTtlFromJsonText(text);
+  cacheSet(cacheKey, { data: text, contentType: 'application/json; charset=utf-8' }, ttl, { upstream });
+
+  ctx.source = 'UPSTREAM';
+  ctx.cacheStatus = 'MISS';
+
+  finalizeDoHHeaders(res, ctx, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'X-Cache': 'MISS',
+  });
+  res.writeHead(200);
+  res.end(text);
+  return logDone(ctx, { status: 200 });
 }
 
-// ==================== 首页 ====================
-function renderHome(origin) {
-  const ep = `${origin}/dns-query`;
-  const hardcodedHtml = Object.entries(HARDCODED).map(([domain, records]) => {
-    const parts = [];
-    if (records.A) parts.push(`A: ${records.A.join(', ')}`);
-    if (records.AAAA) parts.push(`AAAA: ${records.AAAA.join(', ')}`);
-    return `<div><strong>${domain}</strong><br>${parts.join('<br>')}</div>`;
-  }).join('<br>');
+function refreshJsonInBackground(name, type, cacheKey) {
+  fetchUpstreamSimple(
+    `?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`,
+    { Accept: 'application/dns-json, application/json;q=0.9' }
+  )
+    .then(async ({ upstream, resp }) => {
+      const text = await resp.text();
+      const ttl = extractTtlFromJsonText(text);
+      cacheSet(cacheKey, { data: text, contentType: 'application/json; charset=utf-8' }, ttl, { upstream });
+    })
+    .catch(() => {});
+}
 
-  return `<!DOCTYPE html>
+// ==================== 路由 ====================
+async function handleRequest(req, res) {
+  addCommonHeaders(res);
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const pathname = url.pathname;
+
+  const ctx = {
+    id: reqId(),
+    start: nowMs(),
+    ip: clientIp(req),
+    method: req.method,
+    path: pathname,
+    kind: '',
+    ua: String(req.headers['user-agent'] || ''),
+    timings: {},
+    upstreams: [],
+  };
+
+  try {
+    if (pathname === '/health') {
+      return sendJson(res, 200, {
+        status: 'ok',
+        uptime: round(process.uptime()),
+        cache: cache.size,
+        pinned: PINNED_STATE,
+      });
+    }
+
+    if (pathname === '/flush' && req.method === 'POST') {
+      cacheClear();
+      return sendJson(res, 200, { ok: true, cache: 0 });
+    }
+
+    if (pathname === '/dns-query') {
+      if (req.method === 'GET' && url.searchParams.has('dns')) {
+        ctx.kind = 'wire-get';
+        const bodyDecodeStart = nowMs();
+        const dns64 = url.searchParams.get('dns') || '';
+        let queryBuf;
+        try {
+          queryBuf = b64decode(dns64);
+        } catch {
+          return sendJson(res, 400, { error: 'invalid dns param' });
+        }
+        ctx.timings.decode = nowMs() - bodyDecodeStart;
+
+        const result = await resolveWire(queryBuf, ctx);
+
+        finalizeDoHHeaders(res, ctx, {
+          'Content-Type': result.contentType,
+          'X-Cache': result.xCache,
+        });
+        res.writeHead(200);
+        res.end(result.data);
+        return logDone(ctx, { status: 200 });
+      }
+
+      if (req.method === 'POST') {
+        ctx.kind = 'wire-post';
+        const bodyStart = nowMs();
+        const body = await readBody(req);
+        ctx.timings.body = nowMs() - bodyStart;
+
+        if (!body || body.length === 0) {
+          return sendJson(res, 400, { error: 'empty body' });
+        }
+
+        const result = await resolveWire(body, ctx);
+
+        finalizeDoHHeaders(res, ctx, {
+          'Content-Type': result.contentType,
+          'X-Cache': result.xCache,
+        });
+        res.writeHead(200);
+        res.end(result.data);
+        return logDone(ctx, { status: 200 });
+      }
+
+      if (req.method === 'GET' && url.searchParams.has('name')) {
+        return await handleJsonQuery(url.searchParams, res, ctx);
+      }
+
+      return sendJson(res, 400, { error: 'missing name or dns parameter' });
+    }
+
+    if (pathname === '/') {
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
+      res.end(renderHome(`https://${req.headers.host}/dns-query`));
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Not Found');
+  } catch (e) {
+    finalizeDoHHeaders(res, ctx);
+    logDone(ctx, { status: 502, error: e.message });
+    return sendJson(res, 502, { error: e.message, trace: ctx.id });
+  }
+}
+
+// ==================== 首页测试页 ====================
+function renderHome(endpoint) {
+  const pinnedList = Object.entries(PINNED_STATE)
+    .map(([domain, records]) => {
+      const a = records.A?.join(', ') || '-';
+      const aaaa = records.AAAA?.join(', ') || '-';
+      return `<div><b>${domain}</b><br>A: ${a}<br>AAAA: ${aaaa}</div>`;
+    })
+    .join('<hr style="border-color:#333;margin:12px 0">');
+
+  return `<!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DoH Server</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>DoH Probe</title>
 <style>
-*{box-sizing:border-box}
-body{margin:0;padding:20px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);color:#e9eef8}
-.wrap{max-width:900px;margin:0 auto;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:18px;padding:28px;backdrop-filter:blur(12px)}
-h1{margin:0 0 8px;font-size:30px}
-.sub{margin:0 0 18px;color:#aab6d3}
-.card{background:rgba(0,0,0,.22);border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:16px;margin-top:16px}
-.endpoint{font-family:ui-monospace,Consolas,monospace;background:#0d1324;border:1px solid #27406c;padding:12px;border-radius:10px;word-break:break-all;cursor:pointer;color:#7cc8ff}
-.row{display:flex;gap:10px;flex-wrap:wrap}
-input,select,button{border:none;border-radius:10px;padding:10px 12px;font-size:14px}
-input,select{background:#10182c;color:#fff;border:1px solid rgba(255,255,255,.12)}
-button{cursor:pointer;background:linear-gradient(90deg,#58a6ff,#4fd1c5);color:#04111f;font-weight:700}
-button.alt{background:linear-gradient(90deg,#f093fb,#f5576c);color:#19070d}
-button.gray{background:#334155;color:#fff}
-pre{white-space:pre-wrap;background:#09111f;border-radius:10px;padding:14px;max-height:420px;overflow:auto;color:#dbeafe;font-family:ui-monospace,Consolas,monospace}
-.small{font-size:13px;color:#b9c4dd;line-height:1.7}
-.ok{color:#86efac}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}
+.wrap{max-width:860px;margin:0 auto}
+.card{background:#1f2937;border:1px solid #374151;border-radius:14px;padding:18px;margin-bottom:16px}
+h1,h2{margin:0 0 12px}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+input,select,button{padding:10px 12px;border-radius:10px;border:1px solid #4b5563;background:#111827;color:#fff}
+button{cursor:pointer}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+.out{white-space:pre-wrap;background:#0b1220;border:1px solid #334155;border-radius:10px;padding:12px;min-height:120px}
+.small{color:#9ca3af;font-size:13px}
+.ok{color:#34d399}
 .warn{color:#fbbf24}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-@media (max-width:800px){.grid{grid-template-columns:1fr}}
-kbd{background:#111827;border:1px solid #374151;border-bottom-width:2px;padding:1px 6px;border-radius:6px;font-size:12px}
+.bad{color:#f87171}
+a{color:#60a5fa}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>🔒 DoH Server</h1>
-  <p class="sub">专注 linux.do 的低逻辑开销 DoH，支持硬编码返回、缓存和上游回退</p>
-
   <div class="card">
-    <div><strong>DoH Endpoint</strong></div>
-    <div class="endpoint" id="ep">${ep}</div>
-    <div class="small" id="copyTip">点击复制。Chrome / Edge / Firefox 都可直接填这个地址。</div>
-  </div>
-
-  <div class="grid">
-    <div class="card">
-      <div><strong>当前硬编码域名</strong></div>
-      <div class="small" style="margin-top:10px">${hardcodedHtml || '无'}</div>
-      <div class="small" style="margin-top:10px">
-        命中硬编码时，不走上游 DNS，服务端处理通常只有 <span class="ok">1~3ms</span>。
-      </div>
-    </div>
-
-    <div class="card">
-      <div><strong>怎么看真实浏览器延迟</strong></div>
-      <div class="small" style="margin-top:10px">
-        1. 下面的 <strong>Wire POST</strong> 比 JSON 更接近浏览器安全 DNS 实际请求。<br>
-        2. 看 3 个值：<br>
-        - 浏览器总耗时<br>
-        - 服务端处理耗时<br>
-        - 上游耗时<br><br>
-        如果“浏览器总耗时”远大于“服务端处理耗时”，差值基本就是 <span class="warn">链路 + TLS 握手 + 跨境 RTT</span>。
-      </div>
+    <h1>DoH Probe</h1>
+    <div>Endpoint: <code id="ep">${endpoint}</code></div>
+    <div class="small" style="margin-top:8px">
+      这个页面能看浏览器 fetch 的连接/TTFB/服务端内部耗时。<br>
+      真正的“浏览器安全 DNS”冷启动测试，请配合 <code>chrome://net-export/</code> 使用。
     </div>
   </div>
 
   <div class="card">
-    <div><strong>测试</strong></div>
-    <div class="row" style="margin-top:12px">
-      <input id="domain" value="linux.do" placeholder="域名">
+    <h2>快速测试</h2>
+    <div class="row">
+      <input id="name" value="linux.do" placeholder="domain" />
       <select id="type">
         <option>A</option>
         <option>AAAA</option>
@@ -1366,501 +1413,156 @@ kbd{background:#111827;border:1px solid #374151;border-bottom-width:2px;padding:
         <option>TXT</option>
         <option>NS</option>
       </select>
-      <label class="small" style="display:flex;align-items:center;gap:6px">
-        <input id="forceUpstream" type="checkbox" style="width:16px;height:16px"> 强制走上游
-      </label>
-      <label class="small" style="display:flex;align-items:center;gap:6px">
-        <input id="noCache" type="checkbox" checked style="width:16px;height:16px"> 跳过缓存
-      </label>
+      <button onclick="runOnce()">测 1 次</button>
+      <button onclick="runTwice()">测 2 次（看连接复用/缓存）</button>
     </div>
-
-    <div class="row" style="margin-top:12px">
-      <button id="btnJson">JSON GET 测试</button>
-      <button id="btnWire">Wire POST 测试（更接近浏览器 DoH）</button>
-      <button class="alt" id="btnCompare">跑一组对比</button>
-      <button class="gray" id="btnClear">清空输出</button>
+    <div class="small" style="margin-top:10px">
+      首次慢，常常不是服务端慢，而是浏览器到平台的 TCP/TLS 建连慢。
     </div>
-
-    <pre id="out" style="margin-top:14px;display:block"></pre>
+    <pre id="out" class="out"></pre>
   </div>
 
-  <div class="card small">
-    <strong>更真实的最终验证：</strong><br>
-    把浏览器“安全 DNS”直接设成上面的 DoH 地址，然后用无痕窗口首次打开 <kbd>https://linux.do</kbd>。<br>
-    这个首页测试能帮你看清：到底是服务端慢，还是 Render / TLS / 跨境链路慢。
+  <div class="card">
+    <h2>当前 pinned</h2>
+    ${pinnedList}
+  </div>
+
+  <div class="card">
+    <h2>真实浏览器 DoH 测试方法</h2>
+    <div class="small">
+      1. 在 Chrome/Edge 设置里把安全 DNS 改成：<code>${endpoint}</code><br>
+      2. 打开 <code>chrome://net-export/</code><br>
+      3. Start Logging to Disk<br>
+      4. 完全退出浏览器，再重新打开<br>
+      5. 访问 <code>https://linux.do</code><br>
+      6. 查看日志中 <code>DOH / HOST_RESOLVER / SSL_CONNECT_JOB / HTTP_STREAM_JOB</code>
+    </div>
   </div>
 </div>
 
 <script>
-const E = ${JSON.stringify(ep)};
-const out = document.getElementById('out');
-const epEl = document.getElementById('ep');
-const copyTip = document.getElementById('copyTip');
+const EP = ${JSON.stringify(endpoint)};
 
-epEl.addEventListener('click', async () => {
-  try {
-    await navigator.clipboard.writeText(E);
-    copyTip.textContent = '✅ 已复制';
-    setTimeout(() => copyTip.textContent = '点击复制。Chrome / Edge / Firefox 都可直接填这个地址。', 1600);
-  } catch {}
-});
+function fmt(n){ return typeof n === 'number' && isFinite(n) ? n.toFixed(1) + 'ms' : '-'; }
 
-function log(s='') {
-  out.textContent += s + "\\n";
-  out.scrollTop = out.scrollHeight;
+function serverTimingToText(entry){
+  if(!entry || !entry.serverTiming || !entry.serverTiming.length) return '无';
+  return entry.serverTiming.map(x => \`\${x.name}=\${fmt(x.duration)}\`).join(', ');
 }
 
-function getOpts() {
-  return {
-    domain: document.getElementById('domain').value.trim(),
-    type: document.getElementById('type').value,
-    forceUpstream: document.getElementById('forceUpstream').checked,
-    noCache: document.getElementById('noCache').checked,
-  };
+function findEntry(url){
+  const entries = performance.getEntriesByName(url, 'resource');
+  return entries[entries.length - 1];
 }
 
-function buildDebugUrl() {
-  const u = new URL(E);
-  const opts = getOpts();
-  if (opts.forceUpstream) u.searchParams.set('force_upstream', '1');
-  if (opts.noCache) u.searchParams.set('no_cache', '1');
-  u.searchParams.set('_', Date.now().toString() + Math.random().toString(16).slice(2));
-  return u.toString();
-}
+async function doFetch(name, type){
+  const url = EP + '?name=' + encodeURIComponent(name) + '&type=' + encodeURIComponent(type) + '&_=' + Date.now() + Math.random();
+  performance.clearResourceTimings();
 
-function typeNameToNum(type) {
-  if (type === 'A') return 1;
-  if (type === 'AAAA') return 28;
-  if (type === 'CNAME') return 5;
-  if (type === 'MX') return 15;
-  if (type === 'TXT') return 16;
-  if (type === 'NS') return 2;
-  return 1;
-}
-
-function buildDnsQuery(name, type) {
-  const labels = name.replace(/\\.+$/,'').split('.');
-  let len = 12 + 4 + 1;
-  for (const l of labels) len += 1 + new TextEncoder().encode(l).length;
-
-  const buf = new Uint8Array(len);
-  crypto.getRandomValues(buf.subarray(0, 2));
-  buf[2] = 0x01; // RD
-  buf[5] = 0x01; // QDCOUNT=1
-
-  let o = 12;
-  for (const label of labels) {
-    const b = new TextEncoder().encode(label);
-    buf[o++] = b.length;
-    buf.set(b, o);
-    o += b.length;
-  }
-  buf[o++] = 0x00;
-
-  const qtype = typeNameToNum(type);
-  buf[o++] = (qtype >> 8) & 0xff;
-  buf[o++] = qtype & 0xff;
-  buf[o++] = 0x00;
-  buf[o++] = 0x01;
-
-  return buf;
-}
-
-function skipName(buf, o) {
-  while (o < buf.length) {
-    const len = buf[o];
-    if (len === 0) return o + 1;
-    if ((len & 0xc0) === 0xc0) return o + 2;
-    o += 1 + len;
-  }
-  return o;
-}
-
-function parseDnsWire(ab) {
-  function readName(buf, start, depth) {
-    depth = depth || 0;
-    if (depth > 8) return '';
-    const labels = [];
-    let o = start;
-    let jumped = false;
-    let end = start;
-
-    while (o < buf.length) {
-      const len = buf[o];
-      if (len === 0) {
-        if (!jumped) end = o + 1;
-        break;
-      }
-      if ((len & 0xc0) === 0xc0) {
-        if (o + 1 >= buf.length) break;
-        const ptr = ((len & 0x3f) << 8) | buf[o + 1];
-        const tail = readName(buf, ptr, depth + 1);
-        if (tail) labels.push(tail);
-        if (!jumped) end = o + 2;
-        jumped = true;
-        break;
-      }
-      const next = o + 1 + len;
-      if (next > buf.length) break;
-      labels.push(new TextDecoder().decode(buf.slice(o + 1, next)));
-      o = next;
-      if (!jumped) end = o;
-    }
-
-    return labels.join('.');
-  }
-
-  const buf = new Uint8Array(ab);
-  const dv = new DataView(ab);
-  const qd = dv.getUint16(4);
-  const an = dv.getUint16(6);
-  let o = 12;
-
-  for (let i = 0; i < qd; i++) {
-    o = skipName(buf, o);
-    o += 4;
-  }
-
-  const ans = [];
-  for (let i = 0; i < an; i++) {
-    o = skipName(buf, o);
-    const type = dv.getUint16(o);
-    const ttl = dv.getUint32(o + 4);
-    const rdlen = dv.getUint16(o + 8);
-    o += 10;
-
-    if (type === 1 && rdlen === 4) {
-      ans.push({
-        type: 'A',
-        ttl,
-        data: [buf[o], buf[o + 1], buf[o + 2], buf[o + 3]].join('.')
-      });
-    } else if (type === 28 && rdlen === 16) {
-      const parts = [];
-      for (let j = 0; j < 16; j += 2) {
-        parts.push(((buf[o + j] << 8) | buf[o + j + 1]).toString(16));
-      }
-      ans.push({
-        type: 'AAAA',
-        ttl,
-        data: parts.join(':')
-      });
-    } else if (type === 5) {
-      ans.push({
-        type: 'CNAME',
-        ttl,
-        data: readName(buf, o)
-      });
-    } else if (type === 2) {
-      ans.push({
-        type: 'NS',
-        ttl,
-        data: readName(buf, o)
-      });
-    } else if (type === 15) {
-      const pref = dv.getUint16(o);
-      ans.push({
-        type: 'MX',
-        ttl,
-        data: pref + ' ' + readName(buf, o + 2)
-      });
-    } else if (type === 16) {
-      let p = o;
-      const txt = [];
-      while (p < o + rdlen) {
-        const l = buf[p++];
-        txt.push(new TextDecoder().decode(buf.slice(p, p + l)));
-        p += l;
-      }
-      ans.push({
-        type: 'TXT',
-        ttl,
-        data: txt.join(' ')
-      });
-    } else {
-      ans.push({
-        type: String(type),
-        ttl,
-        data: 'RDLEN=' + rdlen
-      });
-    }
-
-    o += rdlen;
-  }
-
-  return ans;
-}
-
-function formatMeta(f, total) {
-  const mode = f.headers.get('X-DoH-Mode') || '-';
-  const serverMs = f.headers.get('X-Server-Time-Ms') || '-';
-  const upstreamMs = f.headers.get('X-Upstream-Time-Ms') || '-';
-  const upstream = f.headers.get('X-DoH-Upstream') || '-';
-
-  return [
-    '总耗时: ' + total.toFixed(1) + 'ms',
-    '服务端: ' + serverMs + 'ms',
-    '上游: ' + upstreamMs + 'ms',
-    '模式: ' + mode,
-    '上游源: ' + upstream
-  ].join(' | ');
-}
-
-async function runJsonTest(override) {
-  const opts = Object.assign({}, getOpts(), override || {});
-  if (!opts.domain) {
-    log('❌ 请输入域名');
-    return;
-  }
-
-  const u = new URL(E);
-  u.searchParams.set('name', opts.domain);
-  u.searchParams.set('type', opts.type);
-  if (opts.forceUpstream) u.searchParams.set('force_upstream', '1');
-  if (opts.noCache) u.searchParams.set('no_cache', '1');
-  u.searchParams.set('_', Date.now().toString() + Math.random().toString(16).slice(2));
-
-  log('');
-  log('⏳ JSON GET ' + opts.domain + ' ' + opts.type + (opts.label ? ' [' + opts.label + ']' : '') + ' ...');
-
-  const s = performance.now();
-  const f = await fetch(u.toString(), {
-    headers: {
-      'Accept': 'application/dns-json',
-      'Cache-Control': 'no-store'
-    }
+  const t0 = performance.now();
+  const resp = await fetch(url, {
+    headers: { Accept: 'application/json' },
+    cache: 'no-store',
   });
-  const total = performance.now() - s;
+  const t1 = performance.now();
+  const text = await resp.text();
+  const total = t1 - t0;
+  const entry = findEntry(url);
 
-  if (!f.ok) {
-    log('❌ HTTP ' + f.status + ' | ' + formatMeta(f, total));
-    return;
-  }
+  let body;
+  try { body = JSON.parse(text); } catch { body = null; }
 
-  const j = await f.json();
-  log('✅ ' + formatMeta(f, total));
+  return { url, resp, text, body, total, entry };
+}
 
-  if (j.Answer && j.Answer.length) {
-    const m = {1:'A',2:'NS',5:'CNAME',15:'MX',16:'TXT',28:'AAAA'};
-    j.Answer.forEach(function(a) {
-      log('  ' + (m[a.type] || a.type) + ' ' + a.data + ' TTL:' + a.TTL);
-    });
+function renderResult(tag, result){
+  const { resp, body, total, entry } = result;
+  const out = [];
+
+  out.push('[' + tag + ']');
+  out.push('HTTP: ' + resp.status);
+  out.push('X-Cache: ' + (resp.headers.get('X-Cache') || '-'));
+  out.push('X-App-Time-Ms: ' + (resp.headers.get('X-App-Time-Ms') || '-'));
+  out.push('X-Trace-Id: ' + (resp.headers.get('X-Trace-Id') || '-'));
+  out.push('浏览器总耗时: ' + fmt(total));
+
+  if(entry){
+    const connect = entry.connectEnd > 0 ? (entry.connectEnd - entry.connectStart) : 0;
+    const tls = entry.secureConnectionStart > 0 ? (entry.connectEnd - entry.secureConnectionStart) : 0;
+    const req = entry.responseStart > 0 ? (entry.responseStart - entry.requestStart) : 0;
+    const download = entry.responseEnd > 0 ? (entry.responseEnd - entry.responseStart) : 0;
+
+    out.push('connect: ' + fmt(connect));
+    out.push('tls: ' + fmt(tls));
+    out.push('request→TTFB: ' + fmt(req));
+    out.push('download: ' + fmt(download));
+    out.push('serverTiming: ' + serverTimingToText(entry));
+
+    if(connect === 0 && tls === 0){
+      out.push('提示: 这次大概率复用了浏览器连接');
+    }
   } else {
-    log('  ⚠️ 无 Answer');
-  }
-}
-
-async function runWireTest(override) {
-  const opts = Object.assign({}, getOpts(), override || {});
-  if (!opts.domain) {
-    log('❌ 请输入域名');
-    return;
+    out.push('resource timing: 不可用');
   }
 
-  const u = new URL(E);
-  if (opts.forceUpstream) u.searchParams.set('force_upstream', '1');
-  if (opts.noCache) u.searchParams.set('no_cache', '1');
-  u.searchParams.set('_', Date.now().toString() + Math.random().toString(16).slice(2));
-
-  const q = buildDnsQuery(opts.domain, opts.type);
-
-  log('');
-  log('⏳ Wire POST ' + opts.domain + ' ' + opts.type + (opts.label ? ' [' + opts.label + ']' : '') + ' ...');
-
-  const s = performance.now();
-  const f = await fetch(u.toString(), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/dns-message',
-      'Accept': 'application/dns-message',
-      'Cache-Control': 'no-store'
-    },
-    body: q
-  });
-  const total = performance.now() - s;
-
-  if (!f.ok) {
-    log('❌ HTTP ' + f.status + ' | ' + formatMeta(f, total));
-    return;
-  }
-
-  const ab = await f.arrayBuffer();
-  const ans = parseDnsWire(ab);
-
-  log('✅ ' + formatMeta(f, total));
-  if (ans.length) {
-    ans.forEach(function(a) {
-      log('  ' + a.type + ' ' + a.data + ' TTL:' + a.ttl);
-    });
-  } else {
-    log('  ⚠️ 无 Answer');
-  }
-}
-
-async function runCompare() {
-  const opts = getOpts();
-  if (!opts.domain) {
-    log('❌ 请输入域名');
-    return;
-  }
-
-  log('');
-  log('================ 对比开始 ================');
-  log('域名: ' + opts.domain + ' | 类型: ' + opts.type);
-  log('说明: Wire POST 更接近浏览器安全 DNS 实际请求');
-  log('');
-
-  await runWireTest({
-    forceUpstream: false,
-    noCache: true,
-    label: '默认路径'
-  });
-
-  await runWireTest({
-    forceUpstream: true,
-    noCache: true,
-    label: '强制上游'
-  });
-
-  await runWireTest({
-    forceUpstream: false,
-    noCache: false,
-    label: '允许缓存'
-  });
-
-  log('');
-  log('================ 对比结束 ================');
-  log('如果“服务端 1~5ms，但总耗时 700ms+”，那瓶颈就在 TLS/跨境链路，不在服务端逻辑。');
-}
-
-document.getElementById('btnJson').addEventListener('click', function() {
-  runJsonTest().catch(function(e) {
-    log('❌ ' + e.message);
-  });
-});
-
-document.getElementById('btnWire').addEventListener('click', function() {
-  runWireTest().catch(function(e) {
-    log('❌ ' + e.message);
-  });
-});
-
-document.getElementById('btnCompare').addEventListener('click', function() {
-  runCompare().catch(function(e) {
-    log('❌ ' + e.message);
-  });
-});
-
-document.getElementById('btnClear').addEventListener('click', function() {
-  out.textContent = '';
-});
-
-document.getElementById('domain').addEventListener('keydown', function(e) {
-  if (e.key === 'Enter') {
-    runWireTest().catch(function(err) {
-      log('❌ ' + err.message);
-    });
-  }
-});
-
-(async function init() {
-  try {
-    const s = performance.now();
-    const f = await fetch(E + '?name=linux.do&type=A&no_cache=1&_=' + Date.now(), {
-      headers: { 'Accept': 'application/dns-json' }
-    });
-    const total = performance.now() - s;
-    if (f.ok) {
-      log('🚀 就绪 | ' + formatMeta(f, total));
-      log('建议先点“跑一组对比”，看默认路径 / 强制上游 / 缓存命中的差异。');
-    } else {
-      log('❌ 初始化检测失败: HTTP ' + f.status);
+  if(body && body.Answer && body.Answer.length){
+    out.push('答案:');
+    for(const a of body.Answer){
+      out.push('  ' + a.data + ' TTL:' + a.TTL);
     }
-  } catch (e) {
-    log('❌ 初始化检测失败: ' + e.message);
+  } else {
+    out.push('答案: 无或非 JSON');
   }
-})();
+
+  return out.join('\\n');
+}
+
+async function runOnce(){
+  const name = document.getElementById('name').value.trim();
+  const type = document.getElementById('type').value;
+  const el = document.getElementById('out');
+  el.textContent = '请求中...';
+  try{
+    const r = await doFetch(name, type);
+    el.textContent = renderResult('第1次', r);
+  }catch(e){
+    el.textContent = '错误: ' + e.message;
+  }
+}
+
+async function runTwice(){
+  const name = document.getElementById('name').value.trim();
+  const type = document.getElementById('type').value;
+  const el = document.getElementById('out');
+  el.textContent = '请求中...';
+  try{
+    const r1 = await doFetch(name, type);
+    await new Promise(r => setTimeout(r, 500));
+    const r2 = await doFetch(name, type);
+    el.textContent = renderResult('第1次', r1) + '\\n\\n' + renderResult('第2次', r2);
+  }catch(e){
+    el.textContent = '错误: ' + e.message;
+  }
+}
 </script>
 </body>
 </html>`;
 }
 
-// ==================== 首页处理 ====================
-function handleHome(req, res) {
-  const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
-  const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
-  const origin = proto + '://' + host;
-  send(res, 200, 'text/html; charset=utf-8', renderHome(origin));
-}
-
-// ==================== 清缓存接口 ====================
-function handleFlush(res) {
-  cache.clear();
-  inflight.clear();
-  send(
-    res,
-    200,
-    'application/json; charset=utf-8',
-    JSON.stringify({
-      ok: true,
-      message: 'cache cleared',
-      cache: cache.size,
-      inflight: inflight.size
-    })
-  );
-}
-
-// ==================== 总路由 ====================
-async function handleRequest(req, res) {
-  setCors(res);
-
-  if (req.method === 'OPTIONS') {
-    res.statusCode = 204;
-    return res.end();
-  }
-
-  const url = new URL(req.url, 'http://localhost');
-
-  try {
-    if (url.pathname === '/') {
-      return handleHome(req, res);
-    }
-
-    if (url.pathname === '/health') {
-      return handleHealth(res);
-    }
-
-    if (url.pathname === '/flush') {
-      return handleFlush(res);
-    }
-
-    if (url.pathname === '/dns-query') {
-      if (req.method === 'GET') {
-        if (url.searchParams.has('dns')) {
-          return await handleWireGet(req, res, url);
-        }
-        if (url.searchParams.has('name')) {
-          return await handleJson(req, res, url);
-        }
-        return sendJsonError(res, 400, 'Missing name or dns parameter');
-      }
-
-      if (req.method === 'POST') {
-        return await handleWirePost(req, res, url);
-      }
-
-      return sendJsonError(res, 405, 'Method not allowed');
-    }
-
-    return sendJsonError(res, 404, 'Not found');
-  } catch (e) {
-    console.error('Request error:', e);
-    return sendJsonError(res, 502, e && e.message ? e.message : 'Bad gateway');
-  }
-}
-
 // ==================== 启动 ====================
-createServer(handleRequest).listen(PORT, '0.0.0.0', () => {
-  console.log('DoH server listening on :' + PORT);
-  console.log('Hardcoded domains:', Object.keys(HARDCODED));
+const server = createServer(handleRequest);
+
+server.listen(PORT, '0.0.0.0', async () => {
+  console.log(`DoH server listening on :${PORT}`);
+  console.log(`Pinned enabled: ${ENABLE_PINNED}`);
+  console.log(`Pinned domains: ${Object.keys(PINNED_STATE).join(', ')}`);
+  try {
+    await refreshAllPinned();
+  } catch (e) {
+    console.log('Initial pinned refresh failed:', e.message);
+  }
 });
+
+setInterval(() => {
+  refreshAllPinned().catch(() => {});
+}, PINNED_REFRESH_MS);
